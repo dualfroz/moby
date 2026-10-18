@@ -47,7 +47,14 @@ func WithLocalCache(l logger.Logger, info logger.Info) (logger.Logger, error) {
 				return nil, err
 			}
 		}
-		cacher = logger.NewRingLogger(cacher, info, size)
+		var maxRetries int64
+		if s, exists := info.Config["max-non-blocking-retries"]; exists {
+			maxRetries, err = strconv.ParseInt(s, 10, 64)
+			if err != nil {
+				return nil, err
+			}
+		}
+		cacher = logger.NewRingLogger(cacher, info, size, maxRetries)
 	}
 
 	return &loggerWithCache{

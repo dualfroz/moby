@@ -14,11 +14,12 @@ const (
 // ringLogger is a ring buffer that implements the Logger interface.
 // This is used when lossy logging is OK.
 type ringLogger struct {
-	buffer    *messageRing
-	l         Logger
-	logInfo   Info
-	closeFlag atomic.Bool
-	wg        sync.WaitGroup
+	buffer     *messageRing
+	l          Logger
+	logInfo    Info
+	maxRetries int64
+	closeFlag  atomic.Bool
+	wg         sync.WaitGroup
 }
 
 var (
@@ -39,11 +40,12 @@ func (r *ringWithReader) ReadLogs(ctx context.Context, cfg ReadConfig) *LogWatch
 	return reader.ReadLogs(ctx, cfg)
 }
 
-func newRingLogger(driver Logger, logInfo Info, maxSize int64) *ringLogger {
+func newRingLogger(driver Logger, logInfo Info, maxSize, maxRetries int64) *ringLogger {
 	l := &ringLogger{
-		buffer:  newRing(maxSize),
-		l:       driver,
-		logInfo: logInfo,
+		buffer:     newRing(maxSize),
+		l:          driver,
+		logInfo:    logInfo,
+		maxRetries: maxRetries,
 	}
 	l.wg.Go(l.run)
 	return l
@@ -51,11 +53,13 @@ func newRingLogger(driver Logger, logInfo Info, maxSize int64) *ringLogger {
 
 // NewRingLogger creates a new Logger that is implemented as a RingBuffer wrapping
 // the passed in logger.
-func NewRingLogger(driver Logger, logInfo Info, maxSize int64) Logger {
+// maxRetries is the number of times a message is retried when the passed in
+// logger returns an error; a negative value retries until the logger is closed.
+func NewRingLogger(driver Logger, logInfo Info, maxSize, maxRetries int64) Logger {
 	if maxSize < 0 {
 		maxSize = defaultRingMaxSize
 	}
-	l := newRingLogger(driver, logInfo, maxSize)
+	l := newRingLogger(driver, logInfo, maxSize, maxRetries)
 	if _, ok := driver.(LogReader); ok {
 		return &ringWithReader{l}
 	}
@@ -129,9 +133,15 @@ func (r *ringLogger) run() {
 			// buffer is closed
 			return
 		}
-		if err := r.l.Log(msg); err != nil {
+		for retries := int64(0); ; retries++ {
+			if err = r.l.Log(msg); err == nil {
+				break
+			}
 			logDriverError(r.l.Name(), string(msg.Line), err)
-			PutMessage(msg)
+			if r.closed() || (r.maxRetries >= 0 && retries >= r.maxRetries) {
+				PutMessage(msg)
+				break
+			}
 		}
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"gotest.tools/v3/assert"
 )
 
 type mockLogger struct{ c chan *Message }
@@ -25,7 +27,7 @@ func (l *mockLogger) Close() error {
 
 func TestRingLogger(t *testing.T) {
 	mockLog := &mockLogger{make(chan *Message)} // no buffer on this channel
-	ring := newRingLogger(mockLog, Info{}, 1)
+	ring := newRingLogger(mockLog, Info{}, 1, 0)
 	defer ring.Close()
 
 	// this should never block
@@ -145,6 +147,84 @@ func TestRingDrain(t *testing.T) {
 	}
 }
 
+type failingLogger struct {
+	failures  int
+	attempted chan struct{}
+	logged    chan *Message
+}
+
+func (l *failingLogger) Log(msg *Message) error {
+	select {
+	case l.attempted <- struct{}{}:
+	default:
+	}
+	if l.failures != 0 {
+		l.failures--
+		return errors.New("log driver unavailable")
+	}
+	l.logged <- msg
+	return nil
+}
+
+func (l *failingLogger) Name() string {
+	return "failing"
+}
+
+func (l *failingLogger) Close() error {
+	return nil
+}
+
+func TestRingLoggerRetry(t *testing.T) {
+	failLog := &failingLogger{failures: 2, logged: make(chan *Message)}
+	ring := newRingLogger(failLog, Info{}, defaultRingMaxSize, 2)
+	defer ring.Close()
+
+	assert.NilError(t, ring.Log(&Message{Line: []byte("hello")}))
+
+	select {
+	case msg := <-failLog.logged:
+		assert.Equal(t, string(msg.Line), "hello")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for the message to be retried")
+	}
+}
+
+func TestRingLoggerRetriesExhausted(t *testing.T) {
+	failLog := &failingLogger{failures: 2, logged: make(chan *Message)}
+	ring := newRingLogger(failLog, Info{}, defaultRingMaxSize, 1)
+	defer ring.Close()
+
+	dropped := &Message{Line: []byte("dropped")}
+	assert.NilError(t, ring.Log(dropped))
+	assert.NilError(t, ring.Log(&Message{Line: []byte("delivered")}))
+
+	select {
+	case msg := <-failLog.logged:
+		assert.Equal(t, string(msg.Line), "delivered")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout reading log message")
+	}
+	assert.Check(t, len(dropped.Line) == 0, "dropped message was not returned to the pool")
+}
+
+func TestRingLoggerCloseStopsRetries(t *testing.T) {
+	failLog := &failingLogger{failures: -1, attempted: make(chan struct{}, 1)}
+	ring := newRingLogger(failLog, Info{}, defaultRingMaxSize, -1)
+
+	assert.NilError(t, ring.Log(&Message{Line: []byte("hello")}))
+	<-failLog.attempted
+
+	closed := make(chan error)
+	go func() { closed <- ring.Close() }()
+
+	select {
+	case err := <-closed:
+		assert.NilError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close blocked while the driver kept failing")
+	}
+}
+
 type nopLogger struct{}
 
 func (nopLogger) Name() string       { return "nopLogger" }
@@ -154,7 +234,7 @@ func (nopLogger) Log(*Message) error { return nil }
 func BenchmarkRingLoggerThroughputNoReceiver(b *testing.B) {
 	mockLog := &mockLogger{make(chan *Message)}
 	defer mockLog.Close()
-	l := NewRingLogger(mockLog, Info{}, -1)
+	l := NewRingLogger(mockLog, Info{}, -1, 0)
 	msg := &Message{Line: []byte("hello humans and everyone else!")}
 	b.SetBytes(int64(len(msg.Line)))
 
@@ -166,7 +246,7 @@ func BenchmarkRingLoggerThroughputNoReceiver(b *testing.B) {
 }
 
 func BenchmarkRingLoggerThroughputWithReceiverDelay0(b *testing.B) {
-	l := NewRingLogger(nopLogger{}, Info{}, -1)
+	l := NewRingLogger(nopLogger{}, Info{}, -1, 0)
 	msg := &Message{Line: []byte("hello humans and everyone else!")}
 	b.SetBytes(int64(len(msg.Line)))
 
@@ -199,7 +279,7 @@ func consumeWithDelay(delay time.Duration, c <-chan *Message) (cancel func()) {
 func BenchmarkRingLoggerThroughputConsumeDelay1(b *testing.B) {
 	mockLog := &mockLogger{make(chan *Message)}
 	defer mockLog.Close()
-	l := NewRingLogger(mockLog, Info{}, -1)
+	l := NewRingLogger(mockLog, Info{}, -1, 0)
 	msg := &Message{Line: []byte("hello humans and everyone else!")}
 	b.SetBytes(int64(len(msg.Line)))
 
@@ -216,7 +296,7 @@ func BenchmarkRingLoggerThroughputConsumeDelay1(b *testing.B) {
 func BenchmarkRingLoggerThroughputConsumeDelay10(b *testing.B) {
 	mockLog := &mockLogger{make(chan *Message)}
 	defer mockLog.Close()
-	l := NewRingLogger(mockLog, Info{}, -1)
+	l := NewRingLogger(mockLog, Info{}, -1, 0)
 	msg := &Message{Line: []byte("hello humans and everyone else!")}
 	b.SetBytes(int64(len(msg.Line)))
 
@@ -233,7 +313,7 @@ func BenchmarkRingLoggerThroughputConsumeDelay10(b *testing.B) {
 func BenchmarkRingLoggerThroughputConsumeDelay50(b *testing.B) {
 	mockLog := &mockLogger{make(chan *Message)}
 	defer mockLog.Close()
-	l := NewRingLogger(mockLog, Info{}, -1)
+	l := NewRingLogger(mockLog, Info{}, -1, 0)
 	msg := &Message{Line: []byte("hello humans and everyone else!")}
 	b.SetBytes(int64(len(msg.Line)))
 
@@ -250,7 +330,7 @@ func BenchmarkRingLoggerThroughputConsumeDelay50(b *testing.B) {
 func BenchmarkRingLoggerThroughputConsumeDelay100(b *testing.B) {
 	mockLog := &mockLogger{make(chan *Message)}
 	defer mockLog.Close()
-	l := NewRingLogger(mockLog, Info{}, -1)
+	l := NewRingLogger(mockLog, Info{}, -1, 0)
 	msg := &Message{Line: []byte("hello humans and everyone else!")}
 	b.SetBytes(int64(len(msg.Line)))
 
@@ -267,7 +347,7 @@ func BenchmarkRingLoggerThroughputConsumeDelay100(b *testing.B) {
 func BenchmarkRingLoggerThroughputConsumeDelay300(b *testing.B) {
 	mockLog := &mockLogger{make(chan *Message)}
 	defer mockLog.Close()
-	l := NewRingLogger(mockLog, Info{}, -1)
+	l := NewRingLogger(mockLog, Info{}, -1, 0)
 	msg := &Message{Line: []byte("hello humans and everyone else!")}
 	b.SetBytes(int64(len(msg.Line)))
 
@@ -284,7 +364,7 @@ func BenchmarkRingLoggerThroughputConsumeDelay300(b *testing.B) {
 func BenchmarkRingLoggerThroughputConsumeDelay500(b *testing.B) {
 	mockLog := &mockLogger{make(chan *Message)}
 	defer mockLog.Close()
-	l := NewRingLogger(mockLog, Info{}, -1)
+	l := NewRingLogger(mockLog, Info{}, -1, 0)
 	msg := &Message{Line: []byte("hello humans and everyone else!")}
 	b.SetBytes(int64(len(msg.Line)))
 
